@@ -4,287 +4,344 @@ pragma solidity ^0.8.19;
 import {Test, console} from "forge-std/Test.sol";
 import {FactoryATFi} from "../src/FactoryATFi.sol";
 import {VaultATFi} from "../src/VaultATFi.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+
+// Mock ERC20 with configurable decimals
+contract MockToken is IERC20 {
+    string public name;
+    string public symbol;
+    uint8 public decimals;
+
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+    uint256 private _totalSupply;
+
+    constructor(string memory _name, string memory _symbol, uint8 _decimals) {
+        name = _name;
+        symbol = _symbol;
+        decimals = _decimals;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _balances[to] += amount;
+        _totalSupply += amount;
+    }
+
+    function totalSupply() external view returns (uint256) {
+        return _totalSupply;
+    }
+    function balanceOf(address account) external view returns (uint256) {
+        return _balances[account];
+    }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _balances[msg.sender] -= amount;
+        _balances[to] += amount;
+        return true;
+    }
+    function allowance(
+        address owner,
+        address spender
+    ) external view returns (uint256) {
+        return _allowances[owner][spender];
+    }
+    function approve(address spender, uint256 amount) external returns (bool) {
+        _allowances[msg.sender][spender] = amount;
+        return true;
+    }
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool) {
+        _allowances[from][msg.sender] -= amount;
+        _balances[from] -= amount;
+        _balances[to] += amount;
+        return true;
+    }
+}
+
+// Convenience alias for USDC tests
+contract MockUSDC is MockToken {
+    constructor() MockToken("Mock USDC", "USDC", 6) {}
+}
+
+// Minimal Mock ERC4626 for yield vault validation
+contract MockYieldVault {
+    address public immutable _asset;
+
+    constructor(address assetToken) {
+        _asset = assetToken;
+    }
+
+    function asset() external view returns (address) {
+        return _asset;
+    }
+}
 
 contract FactoryATFiTest is Test {
     FactoryATFi public factory;
-    VaultATFi public testVault;
+    MockUSDC public usdc;
+    MockYieldVault public mockYieldVault;
 
-    // Test event data
-    uint256 constant TEST_STAKE_AMOUNT = 100 * 1e6; // 100 USDC (6 decimals)
-    uint256 constant REGISTRATION_DEADLINE = 30 days;
-    uint256 constant EVENT_DATE = 60 days;
+    address constant TREASURY = 0x6b732552C0E06F69312D7E81969E28179E228C20;
+
+    uint256 constant STAKE_AMOUNT = 10 * 1e6;
     uint256 constant MAX_PARTICIPANTS = 50;
 
+    address public user1;
+    address public user2;
+
     event VaultCreated(
-        uint256 indexed eventId,
+        uint256 indexed vaultId,
         address indexed vault,
-        address indexed organizer,
+        address indexed owner,
+        address assetToken,
         uint256 stakeAmount,
-        uint256 maxParticipant,
-        uint256 registrationDeadline,
-        uint256 eventDate
+        uint256 maxParticipants,
+        address yieldVault,
+        uint256 timestamp
     );
 
     function setUp() public {
+        user1 = makeAddr("user1");
+        user2 = makeAddr("user2");
+
+        // Deploy mock USDC
+        usdc = new MockUSDC();
+
+        // Deploy mock yield vault that returns USDC as asset
+        mockYieldVault = new MockYieldVault(address(usdc));
+
         // Deploy the factory contract
-        factory = new FactoryATFi();
+        factory = new FactoryATFi(TREASURY, address(mockYieldVault), address(usdc));
     }
 
-    function testFactoryDeployment() public {
-        // Test that factory is deployed correctly
-        assertTrue(address(factory) != address(0), "Factory should be deployed");
-        assertEq(factory.eventIdCounter(), 1, "Initial eventId counter should be 1");
+    // ============ Deployment Tests ============
+
+    function testFactoryDeployment() public view {
+        assertEq(factory.treasury(), TREASURY);
+        assertEq(factory.usdcToken(), address(usdc));
+        assertEq(factory.morphoVault(), address(mockYieldVault));
+        assertEq(factory.getVaultCount(), 0);
+        assertTrue(factory.isTokenSupported(address(usdc)));
     }
 
-    function testCreateEventValidParameters() public {
-        uint256 deadline = block.timestamp + REGISTRATION_DEADLINE;
-        uint256 eventDate = block.timestamp + EVENT_DATE;
+    // ============ Create Vault Tests ============
 
-        // Test creating event with valid parameters
-        vm.startPrank(address(this));
-        uint256 eventId = factory.createEvent(
-            TEST_STAKE_AMOUNT,
-            deadline,
-            eventDate,
+    function testCreateVaultNoYield() public {
+        vm.prank(user1);
+        uint256 vaultId = factory.createVaultNoYield(
+            address(usdc),
+            STAKE_AMOUNT,
             MAX_PARTICIPANTS
         );
-        vm.stopPrank();
 
-        // Verify event creation
-        assertEq(eventId, 1, "Event ID should be 1");
-        assertEq(factory.eventIdCounter(), 2, "Event ID counter should increment to 2");
+        assertEq(vaultId, 1);
+        assertEq(factory.getVaultCount(), 1);
 
-        // Verify vault was registered in factory
-        address[] memory createdVaults = new address[](1);
-        // We need to check if vault was registered - but we don't have a getter for the vault list
-        // So we'll use the isValidVault function with the address from the event
+        address vaultAddr = factory.getVault(vaultId);
+        assertTrue(vaultAddr != address(0));
+        assertTrue(factory.isVault(vaultAddr));
+
+        VaultATFi vault = VaultATFi(vaultAddr);
+        assertEq(vault.stakeAmount(), STAKE_AMOUNT);
+        assertEq(vault.maxParticipants(), MAX_PARTICIPANTS);
+        assertEq(vault.owner(), user1);
+        // Should have no yield vault
+        assertFalse(vault.hasYield());
+        assertEq(address(vault.yieldVault()), address(0));
     }
 
-    function testCreateEventInvalidDeadline() public {
-        // Test with deadline after event date
-        uint256 invalidDeadline = block.timestamp + EVENT_DATE;
-        uint256 eventDate = block.timestamp + REGISTRATION_DEADLINE;
+    function testCreateVaultWithYield() public {
+        vm.prank(user1);
+        uint256 vaultId = factory.createVault(address(usdc), STAKE_AMOUNT, MAX_PARTICIPANTS);
 
-        vm.startPrank(address(this));
-        vm.expectRevert("Invalid deadline");
-        factory.createEvent(
-            TEST_STAKE_AMOUNT,
-            invalidDeadline,
-            eventDate,
+        address vaultAddr = factory.getVault(vaultId);
+        VaultATFi vault = VaultATFi(vaultAddr);
+
+        // Should have yield vault set
+        assertTrue(vault.hasYield());
+        assertEq(address(vault.yieldVault()), address(mockYieldVault));
+    }
+
+    function testCreateMultipleVaults() public {
+        vm.prank(user1);
+        uint256 id1 = factory.createVaultNoYield(
+            address(usdc),
+            STAKE_AMOUNT,
             MAX_PARTICIPANTS
         );
-        vm.stopPrank();
+
+        vm.prank(user2);
+        uint256 id2 = factory.createVaultNoYield(address(usdc), STAKE_AMOUNT * 2, 100);
+
+        assertEq(id1, 1);
+        assertEq(id2, 2);
+        assertEq(factory.getVaultCount(), 2);
+
+        assertTrue(factory.getVault(id1) != factory.getVault(id2));
     }
 
-    function testCreateEventDeadlineInPast() public {
-        // Test with deadline in the past
-        uint256 pastDeadline = block.timestamp > 3600 ? block.timestamp - 3600 : 0;
-        uint256 eventDate = block.timestamp + EVENT_DATE;
-
-        vm.startPrank(address(this));
-        vm.expectRevert("Deadline in past");
-        factory.createEvent(
-            TEST_STAKE_AMOUNT,
-            pastDeadline,
-            eventDate,
-            MAX_PARTICIPANTS
-        );
-        vm.stopPrank();
-    }
-
-    function testCreateEventZeroStakeAmount() public {
-        uint256 deadline = block.timestamp + REGISTRATION_DEADLINE;
-        uint256 eventDate = block.timestamp + EVENT_DATE;
-
-        vm.startPrank(address(this));
-        vm.expectRevert("Invalid stake amount");
-        factory.createEvent(
-            0,
-            deadline,
-            eventDate,
-            MAX_PARTICIPANTS
-        );
-        vm.stopPrank();
-    }
-
-    function testCreateEventZeroMaxParticipants() public {
-        uint256 deadline = block.timestamp + REGISTRATION_DEADLINE;
-        uint256 eventDate = block.timestamp + EVENT_DATE;
-
-        vm.startPrank(address(this));
-        vm.expectRevert("Invalid max participants");
-        factory.createEvent(
-            TEST_STAKE_AMOUNT,
-            deadline,
-            eventDate,
-            0
-        );
-        vm.stopPrank();
-    }
-
-    function testCreateEventEmitsEvent() public {
-        uint256 deadline = block.timestamp + REGISTRATION_DEADLINE;
-        uint256 eventDate = block.timestamp + EVENT_DATE;
-
-        vm.startPrank(address(this));
-
-        // Expect the VaultCreated event to be emitted
-        // We can't predict the exact vault address, so we'll check that an event is emitted
-        // with the correct parameters except for the vault address
+    function testCreateVaultEmitsEvent() public {
+        vm.prank(user1);
+        // Check indexed params (vaultId, skip vault addr, owner) and non-indexed data
         vm.expectEmit(true, false, true, true);
-        emit VaultCreated(1, address(0), address(this), TEST_STAKE_AMOUNT, MAX_PARTICIPANTS, deadline, eventDate);
-        uint256 eventId = factory.createEvent(
-            TEST_STAKE_AMOUNT,
-            deadline,
-            eventDate,
+        emit VaultCreated(
+            1,
+            address(0), // vault address unknown ahead of time
+            user1,
+            address(usdc),
+            STAKE_AMOUNT,
+            MAX_PARTICIPANTS,
+            address(0),
+            block.timestamp
+        );
+        factory.createVaultNoYield(address(usdc), STAKE_AMOUNT, MAX_PARTICIPANTS);
+    }
+
+    function testCreateVaultWithYieldEmitsEvent() public {
+        vm.prank(user1);
+        // Check indexed params (vaultId, skip vault addr, owner) and non-indexed data
+        vm.expectEmit(true, false, true, true);
+        emit VaultCreated(
+            1,
+            address(0), // vault address unknown ahead of time
+            user1,
+            address(usdc),
+            STAKE_AMOUNT,
+            MAX_PARTICIPANTS,
+            address(mockYieldVault),
+            block.timestamp
+        );
+        factory.createVault(address(usdc), STAKE_AMOUNT, MAX_PARTICIPANTS);
+    }
+
+    function testCreateVaultFailsWithZeroStakeAmount() public {
+        vm.prank(user1);
+        vm.expectRevert(FactoryATFi.InvalidStakeAmount.selector);
+        factory.createVaultNoYield(address(usdc), 0, MAX_PARTICIPANTS);
+    }
+
+    function testCreateVaultFailsWithZeroMaxParticipants() public {
+        vm.prank(user1);
+        vm.expectRevert(FactoryATFi.ExceedsMaxParticipants.selector);
+        factory.createVaultNoYield(address(usdc), STAKE_AMOUNT, 0);
+    }
+
+    // ============ Admin Tests ============
+
+    function testSetMorphoVault() public {
+        address newMorpho = address(0x456);
+        factory.setMorphoVault(newMorpho);
+        assertEq(factory.morphoVault(), newMorpho);
+    }
+
+    function testRegisterAssetToken() public {
+        MockToken newToken = new MockToken("NewToken", "NEW", 6);
+        assertFalse(factory.isTokenSupported(address(newToken)));
+
+        factory.registerAssetToken(address(newToken), true);
+        assertTrue(factory.isTokenSupported(address(newToken)));
+
+        factory.registerAssetToken(address(newToken), false);
+        assertFalse(factory.isTokenSupported(address(newToken)));
+    }
+
+    function testPauseAndUnpause() public {
+        // Factory inherits Pausable which has paused() public view
+        assertFalse(factory.paused());
+
+        factory.pause();
+        assertTrue(factory.paused());
+
+        factory.unpause();
+        assertFalse(factory.paused());
+    }
+
+    function testCannotCreateVaultWhenPaused() public {
+        factory.pause();
+
+        vm.expectRevert();
+        factory.createVaultNoYield(address(usdc), STAKE_AMOUNT, MAX_PARTICIPANTS);
+
+        factory.unpause();
+
+        uint256 vaultId = factory.createVaultNoYield(address(usdc), STAKE_AMOUNT, MAX_PARTICIPANTS);
+        assertEq(vaultId, 1);
+    }
+
+    function testOnlyOwnerCanSetMorphoVault() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        factory.setMorphoVault(address(0x123));
+    }
+
+    function testOnlyOwnerCanRegisterTokens() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        factory.registerAssetToken(address(usdc), true);
+    }
+
+    function testOnlyOwnerCanPause() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        factory.pause();
+
+        vm.prank(user1);
+        vm.expectRevert();
+        factory.unpause();
+    }
+
+    // ============ USDC-Only Yield Restriction Tests ============
+
+    function testCreateVaultWithYieldFailsForNonUSDC() public {
+        // Create IDRX token (2 decimals)
+        MockToken idrx = new MockToken("IDRX", "IDRX", 2);
+        factory.registerAssetToken(address(idrx), true);
+
+        vm.prank(user1);
+        vm.expectRevert(FactoryATFi.YieldOnlySupportsUSDC.selector);
+        factory.createVault(address(idrx), 100_00, MAX_PARTICIPANTS); // 100 IDRX
+    }
+
+    function testCreateVaultNoYieldWorksWithIDRX() public {
+        // Create IDRX token (2 decimals)
+        MockToken idrx = new MockToken("IDRX", "IDRX", 2);
+        factory.registerAssetToken(address(idrx), true);
+
+        vm.prank(user1);
+        uint256 vaultId = factory.createVaultNoYield(
+            address(idrx),
+            100_00, // 100 IDRX (2 decimals)
             MAX_PARTICIPANTS
         );
-        vm.stopPrank();
 
-        // Verify event ID
-        assertEq(eventId, 1, "Should emit event with ID 1");
+        VaultATFi vault = VaultATFi(factory.getVault(vaultId));
+        assertEq(address(vault.assetToken()), address(idrx));
+        assertFalse(vault.hasYield());
+        assertEq(vault.stakeAmount(), 100_00);
     }
 
-    function testCreateEventMultipleEvents() public {
-        uint256 deadline1 = block.timestamp + REGISTRATION_DEADLINE;
-        uint256 deadline2 = block.timestamp + REGISTRATION_DEADLINE;
-        uint256 eventDate1 = block.timestamp + EVENT_DATE;
-        uint256 eventDate2 = block.timestamp + EVENT_DATE + 1 days;
-
-        vm.startPrank(address(this));
-
-        // Create first event
-        uint256 eventId1 = factory.createEvent(
-            TEST_STAKE_AMOUNT,
-            deadline1,
-            eventDate1,
+    function testCreateVaultNoYieldWorksWithUSDC() public {
+        vm.prank(user1);
+        uint256 vaultId = factory.createVaultNoYield(
+            address(usdc),
+            STAKE_AMOUNT,
             MAX_PARTICIPANTS
         );
 
-        // Create second event
-        uint256 eventId2 = factory.createEvent(
-            TEST_STAKE_AMOUNT * 2, // Different stake amount
-            deadline2,
-            eventDate2,
-            MAX_PARTICIPANTS + 10 // Different max participants
-        );
-
-        vm.stopPrank();
-
-        // Verify both events were created with different IDs
-        assertEq(eventId1, 1, "First event ID should be 1");
-        assertEq(eventId2, 2, "Second event ID should be 2");
-        assertEq(factory.eventIdCounter(), 3, "Event ID counter should be 3");
+        VaultATFi vault = VaultATFi(factory.getVault(vaultId));
+        assertEq(address(vault.assetToken()), address(usdc));
+        assertFalse(vault.hasYield());
     }
 
-    function testIsValidVaultWithValidVault() public {
-        uint256 deadline = block.timestamp + REGISTRATION_DEADLINE;
-        uint256 eventDate = block.timestamp + EVENT_DATE;
+    function testCreateVaultFailsWithUnsupportedToken() public {
+        MockToken unsupported = new MockToken("Unsupported", "UNS", 18);
+        // Don't register it
 
-        vm.startPrank(address(this));
-        uint256 eventId = factory.createEvent(
-            TEST_STAKE_AMOUNT,
-            deadline,
-            eventDate,
-            MAX_PARTICIPANTS
-        );
-        vm.stopPrank();
-
-        // We need to get the vault address from the event or from the created VaultATFi
-        // Since we can't easily get it here, we'll skip this test for now
-        // In a real test, you'd emit the vault address or use a mapping to track it
-    }
-
-    function testIsValidVaultWithInvalidAddress() public {
-        // Test with a random address
-        address randomAddress = address(0x123456789);
-
-        // Should return false for non-vault addresses
-        assertFalse(factory.isValidVault(randomAddress), "Random address should not be a valid vault");
-        assertFalse(factory.isValidVault(address(0)), "Zero address should not be a valid vault");
-    }
-
-    function testCreateEventWithExtremeValues() public {
-        // Test with maximum reasonable values
-        uint256 maxStakeAmount = type(uint256).max;
-        uint256 maxDeadline = block.timestamp + 365 days; // 1 year
-        uint256 maxEventDate = block.timestamp + 365 days + 1; // 1 year + 1 day
-        uint256 maxParticipants = type(uint256).max;
-
-        vm.startPrank(address(this));
-
-        // Test max stake amount (but need to ensure it doesn't overflow)
-        uint256 reasonableMaxStake = 1_000_000 * 1e6; // 1M USDC
-        uint256 eventId = factory.createEvent(
-            reasonableMaxStake,
-            maxDeadline,
-            maxEventDate,
-            MAX_PARTICIPANTS
-        );
-
-        vm.stopPrank();
-
-        assertTrue(eventId > 0, "Should create event with extreme values");
-    }
-
-    function testEventCreationWithDifferentOrganizers() public {
-        uint256 deadline = block.timestamp + REGISTRATION_DEADLINE;
-        uint256 eventDate = block.timestamp + EVENT_DATE;
-
-        address organizer1 = address(0x1111111111111111111111111111111111111111);
-        address organizer2 = address(0x2222222222222222222222222222222222222222);
-
-        // First organizer creates event
-        vm.startPrank(organizer1);
-        uint256 eventId1 = factory.createEvent(
-            TEST_STAKE_AMOUNT,
-            deadline,
-            eventDate,
-            MAX_PARTICIPANTS
-        );
-        vm.stopPrank();
-
-        // Second organizer creates event
-        vm.startPrank(organizer2);
-        uint256 eventId2 = factory.createEvent(
-            TEST_STAKE_AMOUNT * 2,
-            deadline,
-            eventDate,
-            MAX_PARTICIPANTS + 10
-        );
-        vm.stopPrank();
-
-        // Verify both events were created
-        assertEq(eventId1, 1, "First event ID should be 1");
-        assertEq(eventId2, 2, "Second event ID should be 2");
-    }
-
-    // Fuzzing test for createEvent function
-    function testFuzzCreateEvent(
-        uint256 stakeAmount,
-        uint256 deadline,
-        uint256 eventDate,
-        uint256 maxParticipant
-    ) public {
-        // Skip invalid values
-        vm.assume(stakeAmount > 0);
-        vm.assume(deadline < eventDate);
-        vm.assume(deadline > block.timestamp);
-        vm.assume(maxParticipant > 0);
-        vm.assume(stakeAmount <= 1_000_000 * 1e6); // Reasonable max limit
-        vm.assume(deadline <= block.timestamp + 365 days);
-        vm.assume(eventDate <= block.timestamp + 365 days + 1);
-        vm.assume(maxParticipant <= 1_000_000);
-
-        vm.startPrank(address(this));
-        uint256 eventId = factory.createEvent(
-            stakeAmount,
-            deadline,
-            eventDate,
-            maxParticipant
-        );
-        vm.stopPrank();
-
-        assertTrue(eventId > 0, "Event should be created successfully");
+        vm.prank(user1);
+        vm.expectRevert(FactoryATFi.TokenNotSupported.selector);
+        factory.createVaultNoYield(address(unsupported), STAKE_AMOUNT, MAX_PARTICIPANTS);
     }
 }
